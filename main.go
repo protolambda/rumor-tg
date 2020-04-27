@@ -257,10 +257,14 @@ func (b *RumorBot) createSession(startedBy *tgbotapi.User, locatedIn *tgbotapi.C
 			stopped:    false,
 			log:        b.log.WithField("session_id", id),
 		}
+		b.openSessions[id] = s
 		go s.Start()
 		return s
 	}
 }
+
+// TODO command to stop session
+
 
 func (b *RumorBot) getSession(startedById int, locatedInId int64) (s *Session, ok bool) {
 	b.sessionsLock.RLock()
