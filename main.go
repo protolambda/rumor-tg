@@ -264,14 +264,29 @@ func (s *Session) ChatEntry(entry map[string]interface{}) {
 				buf.WriteString(html.EscapeString(k))
 				buf.WriteString("</code>")
 				buf.WriteString(": ")
+				snip := false
 				buf.WriteString("<code>")
 				vStr, ok := v.(string)
-				if ok {
-					buf.WriteString(html.EscapeString(vStr))
-				} else {
-
+				if !ok {
+					vStrB, err := json.MarshalIndent(v, "  ", "  ")
+					if err != nil {
+						vStr = "???"
+					}
+					vStr = string(vStrB)
 				}
-				buf.WriteString("</code>\n")
+				if strings.Contains(vStr, "\n") {
+					vStr = "\n" + vStr
+				}
+				if len(vStr) > 300 {
+					vStr = vStr[:300]
+					snip = true
+				}
+				buf.WriteString(html.EscapeString(vStr))
+				buf.WriteString("</code>")
+				if snip {
+					buf.WriteString("...")
+				}
+				buf.WriteRune('\n')
 			}
 		}
 	}
@@ -433,6 +448,9 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 
 	sendChat := func(msg string) {
 		b.Send(tgbotapi.NewMessage(update.Message.Chat.ID, msg))
+	}
+	if update.Message == nil {
+		return
 	}
 	if update.Message.IsCommand() {
 
