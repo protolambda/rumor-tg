@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v2"
 	"html"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ func main() {
 	var port uint16
 	var socketType string
 	var socketPath string
+	var adminUsername string
 	mainCmd := cobra.Command{
 		Use:   "rumor-tg",
 		Short: "Start Rumor telegram bot",
@@ -37,7 +39,7 @@ func main() {
 			log.SetLevel(logrus.TraceLevel)
 			log.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
 
-			startBot(log, tgToken, extName, port, socketType, socketPath)
+			startBot(log, adminUsername, tgToken, extName, port, socketType, socketPath)
 		},
 	}
 	mainCmd.Flags().StringVar(&tgToken, "token", "", "Telegram bot token. Ask the Botfather: https://core.telegram.org/bots#6-botfather")
@@ -45,6 +47,7 @@ func main() {
 	mainCmd.Flags().Uint16Var(&port, "port", 8443, "Port to use locally for the webhook")
 	mainCmd.Flags().StringVar(&socketType, "stype", "unix", "Type of socket to use to make connections to Rumor. 'unix' or 'tcp'")
 	mainCmd.Flags().StringVar(&socketPath, "spath", "example.sock", "Path/address to socket to make connections to Rumor")
+	mainCmd.Flags().StringVar(&adminUsername, "admin", "protolambda", "Telegram username of admin with special permissions")
 
 	if err := mainCmd.Execute(); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "failed to run Rumor telegram bot: %v", err)
@@ -54,7 +57,7 @@ func main() {
 	}
 }
 
-func startBot(log logrus.FieldLogger, tgToken string, extName string, port uint16, rumorSocketType string, rumorSocketPath string) {
+func startBot(log logrus.FieldLogger, adminUsername string, tgToken string, extName string, port uint16, rumorSocketType string, rumorSocketPath string) {
 	bot, err := tgbotapi.NewBotAPI(tgToken)
 	if err != nil {
 		log.Fatal(err)
@@ -89,7 +92,13 @@ func startBot(log logrus.FieldLogger, tgToken string, extName string, port uint1
 		cancel()
 	}()
 
+	// Clear old updates, forget about backlog after restart
+	time.Sleep(time.Second * 3)
+	updates.Clear()
+
 	rbot := &RumorBot{
+		adminUser: adminUsername,
+		whitelistedUsers: make(map[string]struct{}),
 		openSessions: make(map[SessionID]*Session),
 		socketType: rumorSocketType,
 		socketPath: rumorSocketPath,
@@ -273,22 +282,22 @@ func (s *Session) ChatEntry(entry map[string]interface{}) {
 		}
 
 		if len(entry) > 0 {
-			buf.WriteString("\ndata:\n")
 			for k, v := range entry {
-				buf.WriteString("<code>")
+				buf.WriteString("<strong>")
 				buf.WriteString(html.EscapeString(k))
-				buf.WriteString("</code>")
+				buf.WriteString("</strong>")
 				buf.WriteString(": ")
 				snip := false
 				buf.WriteString("<code>")
 				vStr, ok := v.(string)
 				if !ok {
-					vStrB, err := json.MarshalIndent(v, "  ", "  ")
+					vStrB, err := yaml.Marshal(v)
 					if err != nil {
 						vStr = "???"
 					}
 					vStr = string(vStrB)
 				}
+				// put multi-line strings apart from the key
 				if strings.Contains(vStr, "\n") {
 					vStr = "\n" + vStr
 				}
@@ -319,7 +328,7 @@ func (s *Session) ChatEntry(entry map[string]interface{}) {
 		}
 		last.content = buf.String()
 		// dont't proceed if the content is large
-		if len(last.content) < 500 {
+		if len(last.content) < 1000 {
 			s.lastEntryMsg = last
 			editTxt := tgbotapi.NewEditMessageText(s.LocatedIn.ID, last.tgID, last.content)
 			editTxt.ParseMode = "html"
@@ -327,7 +336,7 @@ func (s *Session) ChatEntry(entry map[string]interface{}) {
 			return
 		} else {
 			// Stop next message from appending to this large one
-			last.callID = ""
+			buf.Reset()
 		}
 	}
 
@@ -400,6 +409,9 @@ func NewSessionID(fromID int, chatID int64) SessionID {
 }
 
 type RumorBot struct {
+	adminUser string
+	whitelistedUsers map[string]struct{}
+
 	openSessions map[SessionID]*Session
 	sessionsLock sync.RWMutex
 
@@ -481,6 +493,14 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 		return
 	}
 	if update.Message.IsCommand() {
+		if withAt := update.Message.CommandWithAt(); strings.Contains(withAt, "@") && !b.IsMessageToMe(*update.Message) {
+			// Ignore message if it was intended for some other bot
+			return
+		}
+		if _, ok := b.whitelistedUsers[update.Message.From.UserName]; !ok && update.Message.From.UserName != b.adminUser {
+			sendChat(fmt.Sprintf("Sorry @%s, this bot is not allowed to serve you. Ask @%s", update.Message.From.UserName, b.adminUser))
+			return
+		}
 		switch update.Message.Command() {
 		case "start":
 			s := b.createSession(update.Message.From, update.Message.Chat)
@@ -503,9 +523,35 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 			owner := update.Message.From.UserName
 			cmds := update.Message.CommandArguments()
 			s.SendCmds(actor, owner, cmds)
+		case "access":
+			if update.Message.From.UserName != b.adminUser {
+				sendChat(fmt.Sprintf("Only %s has access to `/allow`", b.adminUser))
+				return
+			}
+			cmdArgs := update.Message.CommandArguments()
+			r := regexp.MustCompile("[^\\s]+")
+			parts := r.FindAllString(cmdArgs, -1)
+			if len(parts) > 1 {
+				mode := parts[0]
+				parts = parts[1:]
+				switch mode {
+				case "add":
+					for _, p := range parts {
+						b.whitelistedUsers[p] = struct{}{}
+					}
+					sendChat(fmt.Sprintf("Allowing users %s to use rumor bot", strings.Join(parts, ", ")))
+				case "rm":
+					for _, p := range parts {
+						delete(b.whitelistedUsers, p)
+					}
+					sendChat(fmt.Sprintf("Denying users %s to use rumor bot", strings.Join(parts, ", ")))
+				default:
+					sendChat("Invalid input, try: /access add|rm usernames... (space separated)")
+				}
+			}
 		case "c":
-			if update.Message.From.UserName != "protolambda" {
-				sendChat("Only protolambda has access to `/c`")
+			if update.Message.From.UserName != b.adminUser {
+				sendChat(fmt.Sprintf("Only %s has access to `/c`", b.adminUser))
 				return
 			}
 			s, ok := b.getSession(update.Message.From.ID, update.Message.Chat.ID)
