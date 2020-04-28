@@ -181,7 +181,22 @@ func (s *Session) Start(nextTryAfter time.Duration) {
 	}()
 }
 
-// TODO command to explitly kill existing session and reconnect to rumor
+func (s *Session) Stop() {
+	s.connLock.Lock()
+	defer s.connLock.Unlock()
+	s.log.Info("Stopping session")
+	s.stopped = true
+	err := s.conn.Close()
+	if err != nil {
+		s.log.Error(err)
+	}
+	if s.LocatedIn.IsPrivate() {
+		s.ChatMsg("Stopped session.")
+	} else {
+		s.ChatMsg(fmt.Sprintf("Stopped session of @%s.", s.StartedBy.UserName))
+	}
+	s.log.Info("stopped session")
+}
 
 func (s *Session) ChatMsg(msg string) (id int, err error) {
 	tmsg := tgbotapi.NewMessage(s.LocatedIn.ID, msg)
@@ -424,7 +439,7 @@ func (b *RumorBot) createSession(startedBy *tgbotapi.User, locatedIn *tgbotapi.C
 			StartedBy:  startedBy,
 			LocatedIn:  locatedIn,
 			stopped:    false,
-			log:        b.log.WithField("session_id", id),
+			log:        b.log.WithFields(logrus.Fields{"session_id": id, "started_by": startedBy.UserName, "located_in": locatedIn.Title}),
 		}
 		b.openSessions[id] = s
 		go s.Start(time.Second * 5)
@@ -443,6 +458,19 @@ func (b *RumorBot) getSession(startedById int, locatedInId int64) (s *Session, o
 	return
 }
 
+func (b *RumorBot) stopSession(startedById int, locatedInId int64) (ok bool) {
+	b.sessionsLock.Lock()
+	defer b.sessionsLock.Unlock()
+	id := NewSessionID(startedById, locatedInId)
+	s, ok := b.openSessions[id]
+	if !ok {
+		return false
+	}
+	delete(b.openSessions, id)
+	s.Stop()
+	return true
+}
+
 func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 	b.log.Debugf("%+v\n", update)
 
@@ -453,11 +481,16 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 		return
 	}
 	if update.Message.IsCommand() {
-
 		switch update.Message.Command() {
 		case "start":
 			s := b.createSession(update.Message.From, update.Message.Chat)
 			s.ChatMsg("Started! Send me a command with /r")
+		case "stop":
+			ok := b.stopSession(update.Message.From.ID, update.Message.Chat.ID)
+			if !ok {
+				sendChat(fmt.Sprintf("Could not find open session for @%s", update.Message.From.UserName))
+				return
+			}
 		case "help":
 			sendChat(fmt.Sprintf("Start Rumor with /start@%s, write Rumor commands with /r", b.Self.UserName))
 		case "r", "rumor":
