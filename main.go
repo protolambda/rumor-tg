@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -99,6 +100,12 @@ func startBot(log logrus.FieldLogger, tgToken string, extName string, port uint1
 	rbot.ListenUpdates(updates)
 }
 
+type EntryMsgTracker struct {
+	tgID int
+	callID string
+	content string
+}
+
 type Session struct {
 	id         SessionID
 	bot        *tgbotapi.BotAPI
@@ -110,6 +117,9 @@ type Session struct {
 	LocatedIn  *tgbotapi.Chat
 	stopped    bool
 	log        logrus.FieldLogger
+	lastEntryMsg  EntryMsgTracker
+	// don't edit last message at the same time
+	lastEntryMsgLock sync.Mutex
 }
 
 func asLineReader(r io.Reader) func() (s string, err error) {
@@ -125,7 +135,7 @@ func asLineReader(r io.Reader) func() (s string, err error) {
 	}
 }
 
-func (s *Session) Start() {
+func (s *Session) Start(nextTryAfter time.Duration) {
 	s.connLock.Lock()
 	defer s.connLock.Unlock()
 	if s.conn != nil {
@@ -134,13 +144,16 @@ func (s *Session) Start() {
 	}
 	conn, err := net.Dial(s.socketType, s.socketPath)
 	if err != nil {
-		s.ChatMsg("failed to reach Rumor instance")
+		s.ChatMsg("failed to reach Rumor instance, retry after "+nextTryAfter.String())
 		s.log.WithError(err).Error(conn)
+		// retry after a while
+		time.Sleep(nextTryAfter)
+		go s.Start(nextTryAfter * 150 / 100)
 		return
 	}
 	s.conn = conn
 	s.ChatMsg("connected to Rumor")
-	s.log.Info("session %s connected to Rumor: %s/%s", s.id, s.socketPath, s.socketType)
+	s.log.Infof("session %s connected to Rumor: %s/%s", s.id, s.socketPath, s.socketType)
 	go func() {
 		nextLine := asLineReader(conn)
 		for {
@@ -150,12 +163,13 @@ func (s *Session) Start() {
 					return
 				}
 				s.log.Errorf("got error when reading line, resetting connection: %v", err)
-				_ = s.conn.Close()
+				conn := s.conn
+				if conn != nil {
+					_ = conn.Close()
+				}
 				s.conn = nil
-				// don't open connections too quick in case of unforeseen problems
-				time.Sleep(time.Second * 5)
-				go s.Start()
-				continue
+				go s.Start(nextTryAfter)
+				return
 			}
 			var data map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &data); err != nil {
@@ -169,17 +183,157 @@ func (s *Session) Start() {
 
 // TODO command to explitly kill existing session and reconnect to rumor
 
-func (s *Session) ChatMsg(msg string) {
+func (s *Session) ChatMsg(msg string) (id int, err error) {
 	tmsg := tgbotapi.NewMessage(s.LocatedIn.ID, msg)
-	if _, err := s.bot.Send(tmsg); err != nil {
+	tmsg.ParseMode = "markdown"
+	m, err := s.bot.Send(tmsg)
+	if err != nil {
 		s.log.Error(err)
+	}
+	return m.MessageID, err
+}
+
+func (s *Session) ChatMarkdown(msg string) (id int, err error) {
+	tmsg := tgbotapi.NewMessage(s.LocatedIn.ID, msg)
+	tmsg.ParseMode = "markdown"
+	m, err := s.bot.Send(tmsg)
+	if err != nil {
+		s.log.Error(err)
+	}
+	return m.MessageID, err
+}
+
+func (s *Session) ChatMsgHtml(msg string) (id int, err error) {
+	tmsg := tgbotapi.NewMessage(s.LocatedIn.ID, msg)
+	tmsg.ParseMode = "html"
+	m, err := s.bot.Send(tmsg)
+	if err != nil {
+		s.log.Error(err)
+	}
+	return m.MessageID, err
+}
+
+func logLvlToEmoji(lvl string) string {
+	switch strings.ToLower(lvl) {
+	case "panic":
+		return "🚨"
+	case "fatal":
+		return "☠️"
+	case "error":
+		return "🔥"
+	case "warn", "warning":
+		return "⚠️"
+	case "info":
+		return "ℹ️"
+	case "debug":
+		return "🔍"
+	case "trace":
+		return "🕵️"
+	default:
+		return "❓"
 	}
 }
 
 func (s *Session) ChatEntry(entry map[string]interface{}) {
-	// TODO: format msg nicely
-	dat, _ := json.Marshal(entry)
-	s.ChatMsg(string(dat))
+	callID, _ := entry["call_id"]
+	delete(entry, "call_id")
+	actor, _ := entry["actor"]
+	delete(entry, "actor")
+	lvl, _ := entry["level"]
+	delete(entry, "level")
+	msg, _ := entry["msg"]
+	delete(entry, "msg")
+	//time, _ := entry["time"]
+	delete(entry, "time")
+
+	var buf strings.Builder
+
+	writeContents := func() {
+		if msg != nil {
+			msgStr := msg.(string)
+			msgStr = strings.TrimRight(msgStr, "\n")
+			buf.WriteString("\n<pre>")
+			buf.WriteString(html.EscapeString(msgStr))
+			buf.WriteString("</pre>")
+		}
+
+		if len(entry) > 0 {
+			buf.WriteString("\ndata:\n")
+			for k, v := range entry {
+				buf.WriteString("<code>")
+				buf.WriteString(html.EscapeString(k))
+				buf.WriteString("</code>")
+				buf.WriteString(": ")
+				buf.WriteString("<code>")
+				vStr, ok := v.(string)
+				if ok {
+					buf.WriteString(html.EscapeString(vStr))
+				} else {
+
+				}
+				buf.WriteString("</code>\n")
+			}
+		}
+	}
+
+	// Append to last message if it's part of the same command
+	s.lastEntryMsgLock.Lock()
+	defer s.lastEntryMsgLock.Unlock()
+	last := s.lastEntryMsg
+	if callID != nil && last.callID == callID.(string) {
+		buf.WriteString(last.content)
+		if _, ok := entry["@success"]; ok {
+			buf.WriteString("\n✅ completed")
+		} else {
+			writeContents()
+		}
+		last.content = buf.String()
+		// dont't proceed if the content is large
+		if len(last.content) < 500 {
+			s.lastEntryMsg = last
+			editTxt := tgbotapi.NewEditMessageText(s.LocatedIn.ID, last.tgID, last.content)
+			editTxt.ParseMode = "html"
+			s.bot.Send(editTxt)
+			return
+		} else {
+			// Stop next message from appending to this large one
+			last.callID = ""
+		}
+	}
+
+	if _, ok := entry["@success"]; ok {
+		s.ChatMsgHtml(fmt.Sprintf("✅ completed call <code>%s</code> by actor <code>%s</code>",
+			html.EscapeString(callID.(string)), html.EscapeString(actor.(string))))
+		return
+	}
+
+	if msg != nil {
+		buf.WriteString(logLvlToEmoji(lvl.(string)))
+	}
+	if callID != nil {
+		buf.WriteString(" <code>")
+		buf.WriteString(html.EscapeString(callID.(string)))
+		buf.WriteString("</code>")
+	}
+	if actor != nil {
+		buf.WriteString(" <strong>")
+		buf.WriteString(html.EscapeString(actor.(string)))
+		buf.WriteString("</strong>")
+	}
+	writeContents()
+	content := buf.String()
+	m, err := s.ChatMsgHtml(content)
+	if err != nil {
+		// already logged it
+		return
+	}
+	if callID != nil {
+		s.lastEntryMsg = EntryMsgTracker{
+			tgID: m,
+			callID: callID.(string),
+			content: content,
+		}
+	}
 }
 
 // TODO also option for log level of call
@@ -258,7 +412,7 @@ func (b *RumorBot) createSession(startedBy *tgbotapi.User, locatedIn *tgbotapi.C
 			log:        b.log.WithField("session_id", id),
 		}
 		b.openSessions[id] = s
-		go s.Start()
+		go s.Start(time.Second * 5)
 		return s
 	}
 }
@@ -285,7 +439,7 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 		switch update.Message.Command() {
 		case "start":
 			s := b.createSession(update.Message.From, update.Message.Chat)
-			s.ChatMsg("Started! Send me a command with /s")
+			s.ChatMsg("Started! Send me a command with /r")
 		case "help":
 			sendChat(fmt.Sprintf("Start Rumor with /start@%s, write Rumor commands with /r", b.Self.UserName))
 		case "r", "rumor":
