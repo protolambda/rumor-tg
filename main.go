@@ -410,6 +410,7 @@ func NewSessionID(fromID int, chatID int64) SessionID {
 
 type RumorBot struct {
 	adminUser string
+	whitelistLock sync.Mutex
 	whitelistedUsers map[string]struct{}
 
 	openSessions map[SessionID]*Session
@@ -483,6 +484,34 @@ func (b *RumorBot) stopSession(startedById int, locatedInId int64) (ok bool) {
 	return true
 }
 
+func (b *RumorBot) allowUsers(users []string) string {
+	b.whitelistLock.Lock()
+	defer b.whitelistLock.Unlock()
+	for _, p := range users {
+		b.whitelistedUsers[p] = struct{}{}
+	}
+	return fmt.Sprintf("Allowing users %s to use rumor bot", strings.Join(users, ", "))
+}
+
+func (b *RumorBot) denyUsers(users []string) string {
+	b.whitelistLock.Lock()
+	defer b.whitelistLock.Unlock()
+	for _, p := range users {
+		delete(b.whitelistedUsers, p)
+	}
+	return fmt.Sprintf("Denying users %s to use rumor bot", strings.Join(users, ", "))
+}
+
+func (b *RumorBot) listUsers() string {
+	b.whitelistLock.Lock()
+	defer b.whitelistLock.Unlock()
+	usernames := make([]string, 0)
+	for user := range b.whitelistedUsers {
+		usernames = append(usernames, user)
+	}
+	return fmt.Sprintf("Allowed users: %s", strings.Join(usernames, ", "))
+}
+
 func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 	b.log.Debugf("%+v\n", update)
 
@@ -531,23 +560,19 @@ func (b *RumorBot) processUpdate(update tgbotapi.Update) {
 			cmdArgs := update.Message.CommandArguments()
 			r := regexp.MustCompile("[^\\s]+")
 			parts := r.FindAllString(cmdArgs, -1)
-			if len(parts) > 1 {
-				mode := parts[0]
-				parts = parts[1:]
-				switch mode {
+			if len(parts) >= 1 {
+				switch parts[0] {
 				case "add":
-					for _, p := range parts {
-						b.whitelistedUsers[p] = struct{}{}
-					}
-					sendChat(fmt.Sprintf("Allowing users %s to use rumor bot", strings.Join(parts, ", ")))
+					sendChat(b.allowUsers(parts[1:]))
 				case "rm":
-					for _, p := range parts {
-						delete(b.whitelistedUsers, p)
-					}
-					sendChat(fmt.Sprintf("Denying users %s to use rumor bot", strings.Join(parts, ", ")))
+					sendChat(b.denyUsers(parts[1:]))
+				case "list":
+					sendChat(b.listUsers())
 				default:
-					sendChat("Invalid input, try: /access add|rm usernames... (space separated)")
+					sendChat("Invalid input, try: /access list or /access add|rm usernames... (space separated)")
 				}
+			} else {
+				sendChat("Need at least 1 argument")
 			}
 		case "c":
 			if update.Message.From.UserName != b.adminUser {
