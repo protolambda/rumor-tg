@@ -16,6 +16,4 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt \
 
 COPY --from=build /build/app /app
 
-EXPOSE 443
-
 ENTRYPOINT ["/app"]
